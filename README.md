@@ -70,7 +70,7 @@ Dessa forma, pouco importa se a digital que o sistema encontrou foi cadastrada o
 
 ```
 ┌──────────────────┐     ┌───────────────────────────────┐    ┌─────────────────────────┐
-│  Servidor coloca │────▶│  SDK varre array em MEMÓRIA   │───▶│  Encontra matrícula     │
+│  Servidor coloca │────▶   SDK varre array em MEMÓRIA   │───▶   Encontra matrícula    │
 │   o dedo         │     │   (templatesBD)               │    │  (pode ser antiga)      │
 └──────────────────┘     └───────────────────────────────┘    └───────────┬─────────────┘
                                                                           │
