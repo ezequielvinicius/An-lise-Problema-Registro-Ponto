@@ -13,6 +13,31 @@ A origem do problema está na forma como o sistema carrega e identifica as digit
 > [!WARNING]
 > **Por que não dava erro na hora?** A rota via biometria (`registrarPontoBio`) insere a batida de ponto diretamente, sem validar a situação funcional no momento do *insert*. Já a rota "Sem Digital" exibia os erros de "Sem Lotação" que ajudaram a revelar o problema.
 
+### 2.1. Fluxo do Código Original (Com o Bug)
+
+```
+┌──────────────────┐    ┌───────────────────────────────┐   ┌────────────────────────┐
+│  Servidor coloca │───▶│  SDK varre array em MEMÓRIA  │───▶│  Retorna a matrícula  │
+│   o dedo         │    │  (templatesBD)                │   │     que encontrou      │
+└──────────────────┘    └───────────────────────────────┘   │     DIRETO do cache    │
+                                                            └──────────┬─────────────┘
+                                                                      │
+                                                           ┌──────────▼───────────┐
+                                                           │  Registra o ponto    │
+                                                           │  NESSA matrícula     │
+                                                           │  (pode ser a antiga!)│
+                                                           └──────────────────────┘
+```
+
+**O problema:** O código original parava na memória. Qualquer matrícula que o SDK encontrasse (antiga ou nova), era usada diretamente. Sem nenhuma verificação posterior no banco de dados.
+
+Código original de `PessoaService.identificarServidor()`:
+```groovy
+if (encontrouADigital) {
+    return todasDigitais.get(templateEncontrado[0]).matricula  // ← Retorna direto do cache
+}
+```
+
 ## 3. O "Conserto Automático": Por que em alguns dias o erro parava de ocorrer?
 Foi relatado que, depois de um tempo, o servidor passava a marcar o ponto na matrícula nova automaticamente, dando a falsa impressão de que o sistema "aprendeu" ou se corrigiu. A análise do código (`PessoaService.groovy`) revela o que realmente acontecia:
 
@@ -25,11 +50,14 @@ Foi relatado que, depois de um tempo, o servidor passava a marcar o ponto na mat
    
 Quando um desses dois eventos ocorria, o sistema puxava as correções manuais que a TI havia feito no banco. A partir desse minuto, o servidor passava a bater o ponto na matrícula nova "como mágica".
 
+> [!IMPORTANT]
+> **Implicação Crítica para Migrações:** Se a equipe de banco executar um script SQL para corrigir dados e o servidor NÃO for reiniciado (e nenhuma digital for cadastrada), o código **original** continuaria usando os dados antigos do cache. A correção proposta na seção 4 elimina essa dependência para o fluxo de batida de ponto.
+
 ## 4. A Solução Proposta (Ação em Runtime)
 Para resolver o problema de forma definitiva, sem causar impacto na experiência do usuário e sem exigir recadastramento em massa, a solução foi implementada via código (Runtime) no momento da identificação:
 
-1. **Identificação Inicial:** O SDK continuará varrendo o array e poderá encontrar a matrícula antiga (inativa).
-2. **Buscamos qual é a matrícula ATIVA (sem desligamento) desse Título:**
+1. **Identificação Inicial (Memória):** O SDK continua varrendo o array em memória e pode encontrar a matrícula antiga (inativa). A memória é usada **apenas** para descobrir *quem é a pessoa*.
+2. **Resolução da Matrícula Ativa (Banco de Dados):** A partir da matrícula encontrada, buscamos o Título Eleitoral no banco de dados (`Servidor.get()`), e depois buscamos qual matrícula **ativa** (sem desligamento) possui esse mesmo título:
    `SELECT matricula FROM Servidor WHERE titulo = '12345678' AND desligamento IS NULL`
    *Resultado:* `10300997` (A matrícula nova!)
 
@@ -38,7 +66,121 @@ Para resolver o problema de forma definitiva, sem causar impacto na experiência
 
 Dessa forma, pouco importa se a digital que o sistema encontrou foi cadastrada ontem ou há 10 anos atrás. Nós usamos a digital apenas para descobrir **quem é a pessoa** (pelo Título Eleitoral), e então o banco de dados nos diz **qual é o contrato de trabalho atual** dessa pessoa. Ninguém ficará sem conseguir bater ponto!
 
-## 5. Implementação: Código Antes e Depois (Refatorado)
+### 4.1. Fluxo do Código Corrigido
+
+```
+┌──────────────────┐     ┌───────────────────────────────┐    ┌─────────────────────────┐
+│  Servidor coloca │────▶│  SDK varre array em MEMÓRIA   │───▶│  Encontra matrícula     │
+│   o dedo         │     │   (templatesBD)               │    │  (pode ser antiga)      │
+└──────────────────┘     └───────────────────────────────┘    └───────────┬─────────────┘
+                                                                          │
+                                                        ┌─────────────────▼────────────┐
+                                                        │  Servidor.get(matrícula)     │
+                                                        │  → Busca o TÍTULO no BANCO   │
+                                                        └───────────────┬──────────────┘
+                                                                        │
+                                                        ┌───────────────▼───────────────┐
+                                                        │  buscarServidorAtivoPorTitulo │
+                                                        │  → Busca no BANCO quem tem    │
+                                                        │    esse título E desligamento │
+                                                        │    IS NULL                    │
+                                                        └───────────────┬───────────────┘
+                                                                        │
+                                                        ┌───────────────▼──────────────┐
+                                                        │  Retorna a MATRÍCULA ATIVA   │
+                                                        │  → Registra o ponto na       │
+                                                        │    matrícula correta!        │
+                                                        └──────────────────────────────┘
+```
+
+### 4.2. Comparativo: O Papel da Memória vs. Banco de Dados
+
+| Etapa do Processo | Código Original | Código Corrigido |
+|---|---|---|
+| **1. Identificar o dedo** | Memória (cache SDK) | Memória (cache SDK) — **igual** |
+| **2. Resolver qual matrícula usar** | Memória (cache) — **para aqui** | **Banco de dados** (consulta em tempo real) |
+| **3. Resultado** | Matrícula do cache (pode ser inativa) | Matrícula ativa consultada no banco |
+
+> [!NOTE]
+> **Por que a correção funciona mesmo sem reiniciar o servidor?**  
+> Porque a resolução da matrícula ativa (passo 2) é feita em **tempo real no banco de dados**, independente do que está no cache. O cache continua servindo apenas para o SDK biométrico fazer o *matching* do dedo — e pra isso tanto faz se a digital é antiga ou nova. O que importa é só achar o **Título Eleitoral** da pessoa. A partir daí, o banco responde qual é o contrato ativo.
+
+## 5. Diferença Observada nos JSONs: Matrícula Antiga vs. Nova
+
+### 5.1. Os JSONs Observados com caso real
+
+**Matrícula antiga (`10300712`):**
+```json
+{
+  "informacao": {
+    "matricula": "10300712",
+    "nome": "GENIFER GABRYELLY BORGES DA SILVA",
+    "registros": ["13:42"],
+    "impedimento": "SEM_LOTACAO",
+    "habilitarPonto": false
+  },
+  "sucesso": true
+}
+```
+
+**Matrícula nova (`10300997`):**
+```json
+{
+  "informacao": {
+    "matricula": "10300997",
+    "nome": "GENIFER GABRYELLY BORGES DA SILVA",
+    "registros": []
+  },
+  "sucesso": true
+}
+```
+
+### 5.2. Por Que os Campos `impedimento` e `habilitarPonto` Não Aparecem na Matrícula Nova?
+
+Isso **não é um bug** — é o comportamento correto do sistema. O endpoint `getNomeServidorERegistrosDia` em `PessoaController.groovy` monta o JSON assim:
+
+```groovy
+Impedimento impedimento = restricaoHorarioService.buscaImpedimento(request.remoteAddr) ?:
+    lotacaoAtualService.buscaImpedimento(matricula) ?:
+    afastamentoService.buscaImpedimento(matricula)
+
+render new Retorno(sucesso: true,
+    informacao: [matricula: matricula, nome: servidor.nome, registros: registros]
+                + (impedimento ? impedimento.toMap() : [:])  // ← Se não há impedimento, nada é adicionado
+) as JSON
+```
+
+A cadeia de verificação funciona assim:
+
+| Verificação | O que consulta | Matrícula Antiga (10300712) | Matrícula Nova (10300997) |
+|---|---|---|---|
+| **1. Restrição de Horário** | Tabela `RESTRICAO_HORARIO` (por IP) | Sem restrição → `null` | Sem restrição → `null` |
+| **2. Lotação Atual** | Tabela `LOTACAO_ATUAL` (por matrícula) | ❌ **NÃO TEM** lotação → gera `SEM_LOTACAO` | ✅ **TEM** lotação → `null` |
+| **3. Afastamento** | Tabela `AFASTAMENTO` (por matrícula) | Não chega aqui (parou no passo 2) | Sem afastamento → `null` |
+| **Resultado** | — | `impedimento: "SEM_LOTACAO"` + `habilitarPonto: false` | `null` → **campos não adicionados** |
+
+O valor `habilitarPonto: false` vem da tabela `PARAMETRO`, na chave `REGISTRA_SEM_LOTACAO`, que está configurada como `FALSE`. Isso significa: quem **não tem lotação** não pode bater ponto pelo leitor.
+
+### 5.3. Mapeamento Completo: Campos do JSON → Tabelas do Banco
+
+| Campo no JSON | Origem | Tabela | Coluna | Schema |
+|---|---|---|---|---|
+| `matricula` | Parâmetro de entrada | `SERVIDOR` | `MAT_SERVIDOR` | `SRH2` |
+| `nome` | `Servidor.nome` | `SERVIDOR` | `NOM` | `SRH2` |
+| `registros` | `FrequenciaService.findRegistrosDoDia()` | `FRQ_MARCACAO` | `MARCACAO` (filtrado por `DT` = hoje) | `SRH2` |
+| `impedimento` | `LotacaoAtualService` / `AfastamentoService` / `RestricaoHorarioService` | `LOTACAO_ATUAL` / `AFASTAMENTO` / `RESTRICAO_HORARIO` | Derivado (presença/ausência de registro) | — |
+| `habilitarPonto` | `ParametroService.getBoolean()` | `PARAMETRO` | `VALOR` (chave depende do tipo de impedimento) | — |
+
+**Chaves da tabela `PARAMETRO` que controlam o `habilitarPonto`:**
+
+| Tipo de Impedimento | Chave na Tabela `PARAMETRO` |
+|---|---|
+| `SEM_LOTACAO` | `REGISTRA_SEM_LOTACAO` |
+| `FERIAS` | `REGISTRA_EM_FERIAS` |
+| `AFASTAMENTO` | `REGISTRA_EM_AFASTAMENTO` |
+| `RESTRICAO_HORARIO` | `REGISTRA_EM_RESTRICAO_HORARIO` |
+
+## 6. Implementação: Código Antes e Depois (Refatorado)
 
 Abaixo estão as correções aplicadas e refinadas para tratar questões de acoplamento, duplicação de regras e edge cases.
 
@@ -96,19 +238,22 @@ Este é o ponto principal onde a digital é reconhecida. A lógica utiliza o nov
             return null
         }
 
+        // PASSO 1: Pega a matrícula que o cache retornou (pode ser antiga)
         String matriculaEncontrada = todasDigitais.get(templateEncontrado[0]).matricula
+
+        // PASSO 2: Vai ao BANCO buscar o título eleitoral dessa matrícula
         def titulo = Servidor.get(matriculaEncontrada)?.titulo
         
         if (!titulo) {
             return matriculaEncontrada
         }
 
-        // Tenta achar a matrícula ativa usando o método centralizado
+        // PASSO 3: Vai ao BANCO buscar qual matrícula ATIVA possui esse título
         return Servidor.buscarServidorAtivoPorTitulo(titulo)?.matricula ?: matriculaEncontrada
     }
 ```
 **Observação:**
-A refatoração melhora a legibilidade (com *early returns*) e faz uso do `.get()`, que é performático, pois a propriedade `matricula` é a chave primária mapeada da classe `Servidor`.
+A refatoração melhora a legibilidade (com *early returns*) e faz uso do `.get()`, que é performático, pois a propriedade `matricula` é a chave primária mapeada da classe `Servidor`. Os passos 2 e 3 são consultas ao **banco de dados em tempo real**, garantindo que a matrícula retornada é sempre a ativa, independente do que está no cache.
 
 **Código Antes (Método inicializaTemplateArrays):**
 ```groovy
@@ -163,7 +308,7 @@ Corrige as permissões e o login da gestão.
 **Observação:**
 Aplica a mesma lógica centralizada para os fluxos de gestão, removendo a duplicação direta de query e reduzindo o risco de erro humano em manutenções futuras.
 
-## 6. Próximos Passos e Oportunidades de Otimização (Trabalhos Futuros)
+## 7. Próximos Passos e Oportunidades de Otimização (Trabalhos Futuros)
 
 A resolução atual atuou como um fix de segurança, mas existem débitos técnicos arquiteturais identificados que devem ser abordados em refatorações futuras para otimizar performance e resiliência:
 
@@ -178,3 +323,6 @@ A resolução atual atuou como um fix de segurança, mas existem débitos técni
 3. **Race Condition na Recarga do Cache de Digitais (Concorrência):**
    - **O Risco:** Durante o recadastro biométrico (`salvarDigital`), o cache é atualizado em dois passos sequenciais: a substituição da lista `todasDigitais` e a posterior recriação do array `templatesBD`. Como o serviço atua em padrão *Singleton*, se uma leitura ocorrer nesse intervalo (fração de segundo), o sistema fará a busca biométrica (`identificarServidor`) usando o array antigo, retornando um índice que pode apontar para um servidor incorreto na nova lista, gerando um registro indevido de ponto para outra pessoa.
    - **Solução proposta:** Otimizar a recarga do cache construindo o novo array e a nova lista em escopo local durante o `salvarDigital`, e realizar a substituição (atribuição aos campos da classe) de forma sincronizada (`synchronized`) ou atômica. Isso garante que a leitura biométrica sempre consuma o par de lista e array de forma íntegra.
+
+4. **Cuidado com Migrações Destrutivas:**
+   - Se a equipe de banco **deletar** registros da tabela `SERVIDOR` (em vez de apenas preencher a coluna `DT_DESLIG`), o `Servidor.get(matriculaEncontrada)` retornará `null`, o título não será encontrado, e a correção cairá no fallback retornando a matrícula do cache — que pode não existir mais. **Recomendação:** Nunca deletar registros de `SERVIDOR`; sempre usar o campo `DT_DESLIG` para desativação.
